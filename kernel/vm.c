@@ -93,7 +93,7 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
     if(*pte & PTE_V) {
       pagetable = (pagetable_t)PTE2PA(*pte); // next level PT
     } else {
-      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0) // assign PT usage page
+      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0) // assign page to use as PT
         return 0;
       memset(pagetable, 0, PGSIZE);
       *pte = PA2PTE(pagetable) | PTE_V;
@@ -155,14 +155,15 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   if(size == 0)
     panic("mappages: size");
   
+  // set contiguous pages' PTEs
   a = va;
   last = va + size - PGSIZE;
   for(;;){
-    if((pte = walk(pagetable, a, 1)) == 0)
+    if((pte = walk(pagetable, a, 1)) == 0) // dig down to leaf PTE
       return -1;
     if(*pte & PTE_V)
       panic("mappages: remap");
-    *pte = PA2PTE(pa) | perm | PTE_V;
+    *pte = PA2PTE(pa) | perm | PTE_V; // record page's info in PTE
     if(a == last)
       break;
     a += PGSIZE;
@@ -325,20 +326,23 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     pa = PTE2PA(*pte); // pg's physical addr
     flags = PTE_FLAGS(*pte);
 
-    *pte = PTE_R | PTE_X; // allow read & exe
-    
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+    if (flags & PTE_W) // allow only writable pages to be COW
+    {
+      flags = (flags & ~PTE_W) | PTE_COW;
+      *pte |= flags;
     }
+
+    // new = old: two PT don't share same data, just become same PT
+    
+    if(mappages(new, i, PGSIZE, pa, flags) != 0)
+      goto err;
+
+    // TODO: refcnt
   }
   return 0;
 
  err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
+  uvmunmap(new, 0, i / PGSIZE, 0);
   return -1;
 }
 
