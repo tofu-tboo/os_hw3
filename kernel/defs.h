@@ -60,6 +60,9 @@ void            ramdiskintr(void);
 void            ramdiskrw(struct buf*);
 
 // kalloc.c
+extern          uint prefcnt[];
+void            incref(void*);
+// void            decref(void*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);

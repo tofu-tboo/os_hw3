@@ -316,7 +316,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -329,7 +328,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if (flags & PTE_W) // allow only writable pages to be COW
     {
       flags = (flags & ~PTE_W) | PTE_COW;
-      *pte |= flags;
+      *pte = PA2PTE(pa) | flags;
     }
 
     // new = old: two PT don't share same data, just become same PT
@@ -337,7 +336,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if(mappages(new, i, PGSIZE, pa, flags) != 0)
       goto err;
 
-    // TODO: refcnt
+    incref((void*)pa);
   }
   return 0;
 
@@ -367,6 +366,8 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
   pte_t *pte;
+  uint64 offset;
+  uint64 org;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
@@ -374,13 +375,31 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
       return -1;
     pte = walk(pagetable, va0, 0);
     if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-       (*pte & PTE_W) == 0)
+       ((*pte & PTE_W) == 0 && (*pte & PTE_COW) == 0))
       return -1;
+    
+    offset = dstva - va0;
     pa0 = PTE2PA(*pte);
-    n = PGSIZE - (dstva - va0);
+    org = pa0;
+    if (*pte & PTE_COW)
+    {
+      uint flags = PTE_FLAGS(*pte);
+
+      if ((org = (uint64)kalloc()) == 0)
+        return -1;
+
+      memmove((void*)org, (char*)pa0, PGSIZE);
+
+      flags = (flags | PTE_W) & ~PTE_COW;
+      *pte = PA2PTE(org) | flags;
+
+      kfree((void*)pa0);
+    }
+    n = PGSIZE - offset; // write aligning PGSIZE
     if(n > len)
       n = len;
-    memmove((void *)(pa0 + (dstva - va0)), src, n);
+
+    memmove((void*)(org + offset), src, n);
 
     len -= n;
     src += n;

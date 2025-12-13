@@ -68,11 +68,41 @@ usertrap(void)
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
-    printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
-    printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+    uint64 va = r_stval();
+    uint64 scause = r_scause();
+    
+    if (scause == 15)
+    {
+      pte_t *pte = walk(p->pagetable, va, 0);
+      char *mem;
+      if (pte != 0 && (*pte & PTE_COW) && (*pte & PTE_V))
+      {
+        uint64 pa = PTE2PA(*pte);
+        uint flags = PTE_FLAGS(*pte);
+
+        if ((mem = kalloc()) == 0) // full pages
+        {
+          setkilled(p);
+          goto end;
+        }
+
+        memmove(mem, (char*)pa, PGSIZE); // duplicate the page to write, shared PTEs still remain readonly.
+
+        flags = (flags | PTE_W) & ~PTE_COW;
+        *pte = PA2PTE((uint64)mem) | flags;
+        
+        kfree((void*)pa); // refcnt--, free if needed
+
+        goto end;
+      }
+    }
+
+    printf("usertrap(): unexpected scause 0x%lx pid=%d\n", scause, p->pid);
+    printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), va);
     setkilled(p);
   }
 
+  end:
   if(killed(p))
     exit(-1);
 
