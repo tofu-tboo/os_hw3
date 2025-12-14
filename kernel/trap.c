@@ -71,7 +71,7 @@ usertrap(void)
     uint64 va = r_stval();
     uint64 scause = r_scause();
     
-    if (scause == 15)
+    if (scause == 15 && va < MAXVA)
     {
       pte_t *pte = walk(p->pagetable, va, 0);
       char *mem;
@@ -79,19 +79,32 @@ usertrap(void)
       {
         uint64 pa = PTE2PA(*pte);
         uint flags = PTE_FLAGS(*pte);
+        uint64 chunk = PGSIZE;
 
-        if ((mem = kalloc()) == 0) // full pages
+        if (flags & PTE_HUGE)
+        {
+          chunk = LPGSIZE;
+          if ((mem = superalloc()) == 0) // full superpage
+          {
+            setkilled(p);
+            goto end;
+          }
+        }
+        else if ((mem = kalloc()) == 0) // full pages
         {
           setkilled(p);
           goto end;
         }
 
-        memmove(mem, (char*)pa, PGSIZE); // duplicate the page to write, shared PTEs still remain readonly.
+        memmove(mem, (char*)pa, chunk); // duplicate the page to write, shared PTEs still remain readonly.
 
         flags = (flags | PTE_W) & ~PTE_COW;
         *pte = PA2PTE((uint64)mem) | flags;
         
-        kfree((void*)pa); // refcnt--, free if needed
+        if (flags & PTE_HUGE)
+          superfree((void*)pa);
+        else
+          kfree((void*)pa); // refcnt--, free if needed
 
         goto end;
       }
@@ -245,4 +258,3 @@ devintr()
     return 0;
   }
 }
-

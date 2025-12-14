@@ -353,20 +353,25 @@ typedef uint64 *pagetable_t; // 512 PTEs
 
 #define PGSIZE 4096 // bytes per page
 #define PGSHIFT 12  // bits of offset within a page
+#define LPGSIZE (4096 * 512) // 2MB bytes per superpage
+#define PGPERSLOT (LPGSIZE / PGSIZE)
                     //
 #define SUPERPGSIZE (2 * (1 << 20)) // bytes per page
 #define SUPERPGROUNDUP(sz)  (((sz)+SUPERPGSIZE-1) & ~(SUPERPGSIZE-1))
 #define PTE_LEAF(pte) (((pte) & PTE_R) | ((pte) & PTE_W) | ((pte) & PTE_X))
 
-#define PGROUNDUP(sz)  (((sz)+PGSIZE-1) & ~(PGSIZE-1))
-#define PGROUNDDOWN(a) (((a)) & ~(PGSIZE-1))
+#define PGROUNDUP(sz)   (((sz)+PGSIZE-1) & ~(PGSIZE-1))
+#define PGROUNDDOWN(a)  (((a)) & ~(PGSIZE-1))
+#define LPGROUNDUP(sz)  (((sz)+LPGSIZE-1) & ~(LPGSIZE-1))
+#define LPGROUNDDOWN(a) (((a)) & ~(LPGSIZE-1))
 
-#define PTE_V (1L << 0) // valid
-#define PTE_R (1L << 1)
-#define PTE_W (1L << 2)
-#define PTE_X (1L << 3)
-#define PTE_U (1L << 4) // user can access
-#define PTE_COW (1L << 8)
+#define PTE_V     (1L << 0) // valid
+#define PTE_R     (1L << 1)
+#define PTE_W     (1L << 2)
+#define PTE_X     (1L << 3)
+#define PTE_U     (1L << 4) // user can access
+#define PTE_COW   (1L << 8)
+#define PTE_HUGE  (1L << 9)
 
 // shift a physical address to the right place for a PTE.
 #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)

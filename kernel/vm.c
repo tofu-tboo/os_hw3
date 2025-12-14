@@ -98,6 +98,9 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
       memset(pagetable, 0, PGSIZE);
       *pte = PA2PTE(pagetable) | PTE_V;
     }
+    
+    if (*pte & PTE_HUGE && level == 1) // superpage pte
+      return pte;
   }
   return &pagetable[PX(0, va)];
 }
@@ -154,6 +157,39 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 
   if(size == 0)
     panic("mappages: size");
+
+  if (perm & PTE_HUGE)
+  {
+    if (va % LPGSIZE != 0 || pa % LPGSIZE != 0 || size % LPGSIZE != 0) // physically & logically aligned
+      panic("mappages: huge align");
+    a = va;
+    last = va + size - LPGSIZE;
+    for (;;)
+    {
+      pagetable_t pt = pagetable;
+      for (int level = 2; level > 1; level--)
+      {
+        pte_t *pte = &pt[PX(level, a)];
+        if (*pte & PTE_V)
+        {
+          if(*pte & PTE_HUGE)
+            panic("mappages");
+          pt = (pagetable_t)PTE2PA(*pte);
+        }
+      }
+
+      pte = &pt[PX(1, a)];
+      if(*pte & PTE_V)
+        panic("mappages: remap");
+      *pte = PA2PTE(pa) | perm | PTE_V | PTE_HUGE;
+
+      if(a == last)
+        break;
+      a += LPGSIZE;
+      pa += LPGSIZE;
+    }
+    return 0;
+  }
   
   // set contiguous pages' PTEs
   a = va;
@@ -180,22 +216,55 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
   uint64 a;
   pte_t *pte;
+  uint64 chunk;
 
   if((va % PGSIZE) != 0)
     panic("uvmunmap: not aligned");
 
-  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+  for (a = va; a < va + npages * PGSIZE; )
+  {
     if((pte = walk(pagetable, a, 0)) == 0)
       panic("uvmunmap: walk");
     if((*pte & PTE_V) == 0)
       panic("uvmunmap: not mapped");
-    if(PTE_FLAGS(*pte) == PTE_V)
+    if (!PTE_LEAF(*pte))
       panic("uvmunmap: not a leaf");
-    if(do_free){
-      uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+    if (*pte & PTE_HUGE && a % LPGSIZE == 0 && (va + npages * PGSIZE - a) >= LPGSIZE)
+    {
+      chunk = LPGSIZE;
+      if (do_free)
+      {
+        uint64 pa = PTE2PA(*pte);
+        superfree((void*)pa);
+      }
+      *pte = 0;
     }
-    *pte = 0;
+    else if (*pte & PTE_HUGE) // demotion
+    {
+      uint i;
+      uint64 pa = PTE2PA(*pte);
+      uint flags = PTE_FLAGS(*pte) & ~PTE_HUGE;
+      pagetable_t l0 = (pagetable_t)kalloc(); // make new PT
+      if(l0 == 0)
+        panic("uvmunmap: demotion");
+      memset(l0, 0, PGSIZE);
+      *pte = PA2PTE(l0) | PTE_V;
+      for (i = 0; i < PGPERSLOT; i++)
+      {
+        l0[i] = PA2PTE(pa + i * PGSIZE) | flags;
+      }
+      continue;
+    }
+    else
+    {
+      chunk = PGSIZE;
+      if(do_free){ // 기존 경로
+        uint64 pa = PTE2PA(*pte);
+        kfree((void*)pa);
+      }
+      *pte = 0;
+    }
+    a += chunk;
   }
 }
 
@@ -239,8 +308,25 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
   if(newsz < oldsz)
     return oldsz;
 
-  oldsz = PGROUNDUP(oldsz);
+  oldsz = PGROUNDUP(oldsz); // align to next page boundary
   for(a = oldsz; a < newsz; a += PGSIZE){
+    if (a % LPGSIZE == 0 && newsz - a >= LPGSIZE) // superpage can be assigned
+    {
+      if ((mem = superalloc()) == 0)
+      {
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
+      memset(mem, 0, LPGSIZE);
+      if (mappages(pagetable, a, LPGSIZE, (uint64)mem, PTE_R | PTE_U | PTE_HUGE | xperm) != 0)
+      {
+        superfree(mem);
+        uvmdealloc(pagetable, a, oldsz);
+        return 0;
+      }
+      a += (LPGSIZE - PGSIZE);
+      continue;
+    }
     mem = kalloc();
     if(mem == 0){
       uvmdealloc(pagetable, a, oldsz);
@@ -316,14 +402,18 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
+  uint64 chunk;
+  uint64 allocs = 0;
 
-  for(i = 0; i < sz; i += PGSIZE){
+  for(i = 0; i < sz; )
+  {
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte); // pg's physical addr
     flags = PTE_FLAGS(*pte);
+    chunk = (flags & PTE_HUGE) ? LPGSIZE : PGSIZE;
 
     if (flags & PTE_W) // allow only writable pages to be COW
     {
@@ -333,15 +423,21 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
     // new = old: two PT don't share same data, just become same PT
     
-    if(mappages(new, i, PGSIZE, pa, flags) != 0)
+    if (mappages(new, i, chunk, pa, flags) != 0)
       goto err;
 
-    incref((void*)pa);
+    if (flags & PTE_HUGE)
+      sincref((void*)pa);
+    else
+      incref((void*)pa);
+
+    allocs += chunk / PGSIZE;
+    i += chunk;
   }
   return 0;
 
  err:
-  uvmunmap(new, 0, i / PGSIZE, 0);
+  uvmunmap(new, 0, allocs, 0);
   return -1;
 }
 
@@ -368,7 +464,8 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
   pte_t *pte;
   uint64 offset;
   uint64 org;
-
+  uint64 chunk;
+  
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
@@ -377,25 +474,41 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
        ((*pte & PTE_W) == 0 && (*pte & PTE_COW) == 0))
       return -1;
-    
-    offset = dstva - va0;
+
+    chunk = (*pte & PTE_HUGE) ? LPGSIZE : PGSIZE;
+
+    offset = dstva - ((*pte & PTE_HUGE) ? LPGROUNDDOWN(dstva) : va0);
     pa0 = PTE2PA(*pte);
     org = pa0;
     if (*pte & PTE_COW)
     {
       uint flags = PTE_FLAGS(*pte);
 
-      if ((org = (uint64)kalloc()) == 0)
-        return -1;
+      if (*pte & PTE_HUGE)
+      {
+        if ((org = (uint64)superalloc()) == 0)
+          return -1;
 
-      memmove((void*)org, (char*)pa0, PGSIZE);
+        memmove((void*)org, (void*)pa0, LPGSIZE);
+        flags = (flags | PTE_W) & ~PTE_COW;
+        *pte = PA2PTE(org) | flags;
 
-      flags = (flags | PTE_W) & ~PTE_COW;
-      *pte = PA2PTE(org) | flags;
+        superfree((void*)pa0);
+      }
+      else
+      {
+        if ((org = (uint64)kalloc()) == 0)
+          return -1;
 
-      kfree((void*)pa0);
+        memmove((void*)org, (char*)pa0, PGSIZE);
+
+        flags = (flags | PTE_W) & ~PTE_COW;
+        *pte = PA2PTE(org) | flags;
+
+        kfree((void*)pa0);
+      }
     }
-    n = PGSIZE - offset; // write aligning PGSIZE
+    n = chunk - offset;
     if(n > len)
       n = len;
 
@@ -403,7 +516,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
     len -= n;
     src += n;
-    dstva = va0 + PGSIZE;
+    dstva += n;
   }
   return 0;
 }

@@ -62,10 +62,12 @@ void            ramdiskrw(struct buf*);
 // kalloc.c
 extern          uint prefcnt[];
 void            incref(void*);
-// void            decref(void*);
+void            sincref(void*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+void            superfree(void *);
+void*           superalloc(void);
 
 // log.c
 void            initlog(int, struct superblock*);
